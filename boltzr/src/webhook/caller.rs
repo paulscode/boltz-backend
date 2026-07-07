@@ -224,6 +224,10 @@ where
         let client = reqwest::Client::builder()
             .connect_timeout(self.request_timeout)
             .timeout(self.request_timeout)
+            .dns_resolver(Arc::new(super::resolver::SsrfGuardResolver::new(
+                self.allow_insecure,
+            )))
+            .redirect(super::resolver::build_redirect_policy(self.allow_insecure))
             .build()
             .unwrap();
 
@@ -433,23 +437,7 @@ pub async fn check_ip(url: &str, allow_insecure: bool) -> Result<()> {
         .collect(),
     };
 
-    if ips.iter().any(|ip| match ip {
-        IpAddr::V4(ip) => {
-            ip.is_loopback()
-                || ip.is_link_local()
-                || ip.is_multicast()
-                || ip.is_broadcast()
-                || ip.is_private()
-                || ip.is_unspecified()
-        }
-        IpAddr::V6(ip) => {
-            ip.is_loopback()
-                || ip.is_multicast()
-                || ip.is_unicast_link_local()
-                || ip.is_unique_local()
-                || ip.is_unspecified()
-        }
-    }) {
+    if ips.iter().any(super::resolver::is_blocked_ip) {
         return Err(UrlError::InvalidHost.into());
     }
 
@@ -464,7 +452,7 @@ mod caller_test {
     use crate::webhook::types::{WebHookCallData, WebHookCallParams, WebHookEvent};
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
-    use axum::routing::post;
+    use axum::routing::{any, post};
     use axum::{Extension, Json, Router};
     use mockall::{mock, predicate};
     use rstest::rstest;
@@ -1161,9 +1149,11 @@ mod caller_test {
 
     #[rstest]
     #[case("https://8.8.8.8", true)] // Valid public IP v4
+    #[case("https://[::ffff:8.8.8.8]", true)] // Valid public IPv4-mapped IPv6
     #[case("https://[2001:4860:4860::8888]", true)] // Valid public IP v6
     #[case("https://bol.tz", true)] // Valid public domain
     #[case("https://127.0.0.1", false)] // Loopback v4
+    #[case("https://[::ffff:127.0.0.1]", false)] // Loopback IPv4-mapped IPv6
     #[case("https://192.168.1.1", false)] // Private v4
     #[case("https://10.0.0.1", false)] // Private v4
     #[case("https://172.16.0.1", false)] // Private v4
@@ -1191,6 +1181,188 @@ mod caller_test {
     async fn test_check_ip_allow_insecure(#[case] url: &str, #[case] should_pass: bool) {
         let result = check_ip(url, true).await;
         assert_eq!(result.is_ok(), should_pass, "err: {:?}", result.err());
+    }
+
+    #[tokio::test]
+    async fn test_call_webhook_follows_redirect_when_insecure() {
+        let mut web_hook_helper = make_mock_hook_state();
+        web_hook_helper
+            .expect_should_be_skipped()
+            .returning(|_, _| false);
+
+        let id = "redirect_follow";
+        let target_port = 10020;
+        let redirect_port = 10021;
+
+        let hook = WebHook {
+            id: id.to_string(),
+            url: format!("http://127.0.0.1:{redirect_port}"),
+            ..Default::default()
+        };
+
+        web_hook_helper
+            .expect_set_state()
+            .with(predicate::eq(hook.clone()), predicate::eq(WebHookState::Ok))
+            .returning(|_, _| Ok(()));
+
+        let caller = Caller::new(
+            CancellationToken::new(),
+            "test".to_string(),
+            Config {
+                max_retries: Some(5),
+                retry_interval: Some(60),
+                request_timeout: Some(10),
+                block_list: None,
+            },
+            true,
+            web_hook_helper,
+        );
+
+        let (target_cancel, received_calls, _headers) = start_server(target_port).await;
+        let redirect_cancel =
+            start_redirect_server(redirect_port, format!("http://127.0.0.1:{target_port}/")).await;
+
+        let data = WebHookCallData::SwapUpdate(SwapUpdateCallData {
+            id: id.to_string(),
+            status: "some.update".to_string(),
+        });
+
+        let res = caller.call_webhook(hook, data.clone()).await.unwrap();
+        assert_eq!(res, CallResult::Success);
+
+        // The 307 redirect preserves the POST body, so the target sees the call.
+        assert_eq!(received_calls.lock().unwrap().len(), 1);
+        assert_eq!(
+            received_calls.lock().unwrap()[0],
+            WebHookCallParams {
+                event: WebHookEvent::SwapUpdate,
+                data,
+            }
+        );
+
+        target_cancel.cancel();
+        redirect_cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn test_client_blocks_redirect_to_private_ip() {
+        let target_port = 10022;
+        let redirect_port = 10023;
+
+        let (target_cancel, received_calls, _headers) = start_server(target_port).await;
+        let redirect_cancel =
+            start_redirect_server(redirect_port, format!("http://127.0.0.1:{target_port}/")).await;
+
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(5))
+            .dns_resolver(Arc::new(crate::webhook::resolver::SsrfGuardResolver::new(
+                false,
+            )))
+            .redirect(crate::webhook::resolver::build_redirect_policy(false))
+            .build()
+            .unwrap();
+
+        let res = client
+            .post(format!("http://127.0.0.1:{redirect_port}/"))
+            .json(&WebHookCallParams {
+                event: WebHookEvent::SwapUpdate,
+                data: WebHookCallData::SwapUpdate(SwapUpdateCallData {
+                    id: "blocked".to_string(),
+                    status: "some.update".to_string(),
+                }),
+            })
+            .send()
+            .await;
+
+        let err = res.expect_err("redirect to a private IP must be blocked");
+        assert!(
+            err.is_redirect(),
+            "expected a redirect-policy error (initial connect succeeded, redirect blocked), got: {err}"
+        );
+        assert_eq!(
+            received_calls.lock().unwrap().len(),
+            0,
+            "the private-IP redirect target must never be reached"
+        );
+
+        target_cancel.cancel();
+        redirect_cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn test_client_blocks_redirect_to_private_hostname() {
+        let target_port = 10024;
+        let redirect_port = 10025;
+
+        let (target_cancel, received_calls, _headers) = start_server(target_port).await;
+        let redirect_cancel =
+            start_redirect_server(redirect_port, format!("http://localhost:{target_port}/")).await;
+
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(5))
+            .dns_resolver(Arc::new(crate::webhook::resolver::SsrfGuardResolver::new(
+                false,
+            )))
+            .redirect(crate::webhook::resolver::build_redirect_policy(false))
+            .build()
+            .unwrap();
+
+        let res = client
+            .post(format!("http://127.0.0.1:{redirect_port}/"))
+            .json(&WebHookCallParams {
+                event: WebHookEvent::SwapUpdate,
+                data: WebHookCallData::SwapUpdate(SwapUpdateCallData {
+                    id: "blocked".to_string(),
+                    status: "some.update".to_string(),
+                }),
+            })
+            .send()
+            .await;
+
+        assert!(
+            res.is_err(),
+            "redirect to a hostname resolving to a private IP must be blocked"
+        );
+        assert_eq!(
+            received_calls.lock().unwrap().len(),
+            0,
+            "the loopback redirect target must never be reached"
+        );
+
+        target_cancel.cancel();
+        redirect_cancel.cancel();
+    }
+
+    async fn start_redirect_server(port: u16, location: String) -> CancellationToken {
+        async fn redirect_handler(
+            Extension(location): Extension<Arc<String>>,
+        ) -> impl IntoResponse {
+            axum::response::Redirect::temporary(location.as_str())
+        }
+
+        let router = Router::new()
+            .route("/", any(redirect_handler))
+            .layer(Extension(Arc::new(location)));
+
+        let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}"))
+            .await
+            .unwrap();
+
+        let cancellation_token = CancellationToken::new();
+        let token = cancellation_token.clone();
+        tokio::spawn(async move {
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async move {
+                    token.cancelled().await;
+                })
+                .await
+                .unwrap();
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        cancellation_token
     }
 
     async fn start_server(
