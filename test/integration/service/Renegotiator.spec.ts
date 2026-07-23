@@ -565,6 +565,7 @@ describe('Renegotiator', () => {
             claimAddress: await signer.getAddress(),
             refundAddress: await etherBase.getAddress(),
           },
+          expect.any(Number),
           { allowLockupFailedUpdate: true },
         );
       });
@@ -656,6 +657,7 @@ describe('Renegotiator', () => {
             claimAddress: await signer.getAddress(),
             refundAddress: await etherBase.getAddress(),
           },
+          expect.any(Number),
           { allowLockupFailedUpdate: true },
         );
       });

@@ -72,42 +72,51 @@ const querySwapValuesFromLock = async <T extends { preimageHash: Buffer }>(
   const contractAddress = (await contract.getAddress()).toLowerCase();
 
   if (lockTransactionReceipt) {
-    const lockupsFound: T[] = [];
+    const findLockups = async (index: number | undefined): Promise<T[]> => {
+      const lockupsFound: T[] = [];
 
-    for (const log of lockTransactionReceipt.logs) {
-      if (logIndex !== undefined && log.index !== logIndex) {
-        continue;
-      }
-
-      if (log.topics[0] !== topicHash) {
-        continue;
-      }
-      if (log.address.toLowerCase() !== contractAddress) {
-        continue;
-      }
-
-      const event = contract.interface.parseLog(log as any);
-      const values = formatValues(event!.args);
-
-      if (identifier !== undefined && 'preimageHash' in identifier) {
-        if (!values.preimageHash.equals(identifier.preimageHash)) {
+      for (const log of lockTransactionReceipt.logs) {
+        if (index !== undefined && log.index !== index) {
           continue;
         }
-      } else if (identifier !== undefined && 'lockupHash' in identifier) {
-        const computedHash = await computeLockupHash(
-          contract,
-          event!.args as unknown as LockupHashParams,
-        );
-        if (computedHash !== identifier.lockupHash) {
+
+        if (log.topics[0] !== topicHash) {
           continue;
         }
+        if (log.address.toLowerCase() !== contractAddress) {
+          continue;
+        }
+
+        const event = contract.interface.parseLog(log as any);
+        const values = formatValues(event!.args);
+
+        if (identifier !== undefined && 'preimageHash' in identifier) {
+          if (!values.preimageHash.equals(identifier.preimageHash)) {
+            continue;
+          }
+        } else if (identifier !== undefined && 'lockupHash' in identifier) {
+          const computedHash = await computeLockupHash(
+            contract,
+            event!.args as unknown as LockupHashParams,
+          );
+          if (computedHash !== identifier.lockupHash) {
+            continue;
+          }
+        }
+
+        lockupsFound.push(values);
       }
 
-      if (logIndex !== undefined || identifier !== undefined) {
-        return values;
-      }
+      return lockupsFound;
+    };
 
-      lockupsFound.push(values);
+    let lockupsFound = await findLockups(logIndex);
+    if (
+      lockupsFound.length === 0 &&
+      logIndex !== undefined &&
+      identifier !== undefined
+    ) {
+      lockupsFound = await findLockups(undefined);
     }
 
     if (lockupsFound.length === 1) {
@@ -124,6 +133,7 @@ export const queryEtherSwapValuesFromLock = async (
   etherSwap: EtherSwap,
   lockTransactionHash: string,
   lockedByUser: boolean,
+  logIndex?: number,
 ): Promise<EtherSwapValues> =>
   querySwapValuesFromLock(
     provider,
@@ -131,7 +141,7 @@ export const queryEtherSwapValuesFromLock = async (
     lockTransactionHash,
     await getIdentifier(swap, lockedByUser),
     formatEtherSwapValues,
-    undefined,
+    logIndex,
   );
 
 export const queryERC20SwapValuesFromLock = async (
@@ -140,6 +150,7 @@ export const queryERC20SwapValuesFromLock = async (
   erc20Swap: ERC20Swap,
   lockTransactionHash: string,
   lockedByUser: boolean,
+  logIndex?: number,
 ): Promise<ERC20SwapValues> =>
   querySwapValuesFromLock(
     provider,
@@ -147,7 +158,7 @@ export const queryERC20SwapValuesFromLock = async (
     lockTransactionHash,
     await getIdentifier(swap, lockedByUser),
     formatERC20SwapValues,
-    undefined,
+    logIndex,
   );
 
 export const queryEtherSwapValuesFromTransaction = async (

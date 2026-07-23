@@ -8,6 +8,7 @@ import {
   SwapType,
   SwapUpdateEvent,
 } from '../../../lib/consts/Enums';
+import { LockupWriteOutcome } from '../../../lib/db/LockupIdentity';
 import ChainSwapRepository from '../../../lib/db/repositories/ChainSwapRepository';
 import ReverseSwapRepository from '../../../lib/db/repositories/ReverseSwapRepository';
 import SwapRepository from '../../../lib/db/repositories/SwapRepository';
@@ -411,9 +412,10 @@ describe('ArkNursery', () => {
       };
 
       SwapRepository.getSwap = jest.fn().mockResolvedValue(swap);
-      SwapRepository.setLockupTransaction = jest
-        .fn()
-        .mockResolvedValue(updatedSwap);
+      SwapRepository.setLockupTransaction = jest.fn().mockResolvedValue({
+        outcome: LockupWriteOutcome.Acquired,
+        swap: updatedSwap,
+      });
       ChainSwapRepository.getChainSwapByData = jest
         .fn()
         .mockResolvedValue(null);
@@ -479,7 +481,10 @@ describe('ArkNursery', () => {
         .mockResolvedValue(chainSwap);
       ChainSwapRepository.setUserLockupTransaction = jest
         .fn()
-        .mockResolvedValue(updatedChainSwap);
+        .mockResolvedValue({
+          outcome: LockupWriteOutcome.Acquired,
+          swap: updatedChainSwap,
+        });
 
       let emittedEvent: any = null;
       nursery.once('chainSwap.lockup', (data) => {
@@ -588,6 +593,85 @@ describe('ArkNursery', () => {
     });
   });
 
+  describe('competing lockup guard', () => {
+    const mockArkNode = {
+      symbol: 'ARK',
+      subscription: {
+        unsubscribeAddress: jest.fn(),
+      },
+    } as unknown as ArkClient;
+
+    beforeEach(() => {
+      jest.clearAllMocks();
+      nursery.removeAllListeners();
+    });
+
+    test('should ignore a competing chain swap lockup once confirmed', async () => {
+      const chainSwap = {
+        id: 'chain',
+        type: SwapType.Chain,
+        status: SwapUpdateEvent.TransactionConfirmed,
+        receivingData: {
+          symbol: 'ARK',
+          expectedAmount: 100000,
+          transactionId: 'already-recorded',
+        },
+      };
+
+      ChainSwapRepository.getChainSwapByData = jest
+        .fn()
+        .mockResolvedValue(chainSwap);
+      ChainSwapRepository.setUserLockupTransaction = jest.fn();
+
+      const lockupListener = jest.fn();
+      const failedListener = jest.fn();
+      nursery.on('chainSwap.lockup', lockupListener);
+      nursery.on('chainSwap.lockup.failed', failedListener);
+
+      await nursery.checkChainSwapLockup(mockArkNode, {
+        address: 'ark_chain_address',
+        txId: 'different-tx',
+        vout: 0,
+        amount: 100000,
+      } as any);
+
+      expect(
+        ChainSwapRepository.setUserLockupTransaction,
+      ).not.toHaveBeenCalled();
+      expect(lockupListener).not.toHaveBeenCalled();
+      expect(failedListener).not.toHaveBeenCalled();
+    });
+
+    test('should ignore a competing submarine lockup once confirmed', async () => {
+      const swap = {
+        id: 'swap123',
+        type: SwapType.Submarine,
+        expectedAmount: 100000,
+        lockupTransactionId: 'already-recorded',
+        status: SwapUpdateEvent.TransactionConfirmed,
+      };
+
+      SwapRepository.getSwap = jest.fn().mockResolvedValue(swap);
+      SwapRepository.setLockupTransaction = jest.fn();
+
+      const lockupListener = jest.fn();
+      const failedListener = jest.fn();
+      nursery.on('swap.lockup', lockupListener);
+      nursery.on('swap.lockup.failed', failedListener);
+
+      await nursery['checkSubmarineLockup'](mockArkNode, {
+        address: 'ark_address',
+        txId: 'different-tx',
+        vout: 0,
+        amount: 100000,
+      } as any);
+
+      expect(SwapRepository.setLockupTransaction).not.toHaveBeenCalled();
+      expect(lockupListener).not.toHaveBeenCalled();
+      expect(failedListener).not.toHaveBeenCalled();
+    });
+  });
+
   describe('checkSubmarineLockup', () => {
     const mockArkNode = {
       symbol: 'ARK',
@@ -637,9 +721,10 @@ describe('ArkNursery', () => {
       };
 
       SwapRepository.getSwap = jest.fn().mockResolvedValue(swap);
-      SwapRepository.setLockupTransaction = jest
-        .fn()
-        .mockResolvedValue(updatedSwap);
+      SwapRepository.setLockupTransaction = jest.fn().mockResolvedValue({
+        outcome: LockupWriteOutcome.Acquired,
+        swap: updatedSwap,
+      });
 
       let emittedEvent: any = null;
       nursery.once('swap.lockup.failed', (data) => {
@@ -660,7 +745,7 @@ describe('ArkNursery', () => {
         swap,
         'txid',
         50000,
-        true,
+        SwapUpdateEvent.TransactionConfirmed,
         0,
       );
       expect(emittedEvent).not.toBeNull();
@@ -684,9 +769,10 @@ describe('ArkNursery', () => {
       };
 
       SwapRepository.getSwap = jest.fn().mockResolvedValue(swap);
-      SwapRepository.setLockupTransaction = jest
-        .fn()
-        .mockResolvedValue(updatedSwap);
+      SwapRepository.setLockupTransaction = jest.fn().mockResolvedValue({
+        outcome: LockupWriteOutcome.Acquired,
+        swap: updatedSwap,
+      });
 
       const protector = new OverpaymentProtector(Logger.disabledLogger, {
         exemptAmount: 1000,
@@ -713,7 +799,7 @@ describe('ArkNursery', () => {
         swap,
         'txid',
         150000,
-        true,
+        SwapUpdateEvent.TransactionConfirmed,
         0,
       );
       expect(emittedEvent).not.toBeNull();
@@ -736,9 +822,12 @@ describe('ArkNursery', () => {
       SwapRepository.setLockupTransaction = jest.fn().mockImplementation(() => {
         callOrder.push('setLockupTransaction');
         return Promise.resolve({
-          ...swap,
-          lockupTransactionId: 'txid',
-          onchainAmount: 50000,
+          outcome: LockupWriteOutcome.Acquired,
+          swap: {
+            ...swap,
+            lockupTransactionId: 'txid',
+            onchainAmount: 50000,
+          },
         });
       });
 
@@ -784,9 +873,10 @@ describe('ArkNursery', () => {
       };
 
       SwapRepository.getSwap = jest.fn().mockResolvedValue(swap);
-      SwapRepository.setLockupTransaction = jest
-        .fn()
-        .mockResolvedValue(updatedSwap);
+      SwapRepository.setLockupTransaction = jest.fn().mockResolvedValue({
+        outcome: LockupWriteOutcome.Acquired,
+        swap: updatedSwap,
+      });
 
       let emittedEvent: any = null;
       nursery.once('swap.lockup', (data) => {
@@ -807,7 +897,7 @@ describe('ArkNursery', () => {
         swap,
         'txid',
         100000,
-        true,
+        SwapUpdateEvent.TransactionConfirmed,
         0,
       );
       expect(emittedEvent).not.toBeNull();
@@ -829,9 +919,10 @@ describe('ArkNursery', () => {
       };
 
       SwapRepository.getSwap = jest.fn().mockResolvedValue(swap);
-      SwapRepository.setLockupTransaction = jest
-        .fn()
-        .mockResolvedValue(updatedSwap);
+      SwapRepository.setLockupTransaction = jest.fn().mockResolvedValue({
+        outcome: LockupWriteOutcome.Acquired,
+        swap: updatedSwap,
+      });
 
       let emittedEvent: any = null;
       nursery.once('swap.lockup', (data) => {
@@ -914,7 +1005,10 @@ describe('ArkNursery', () => {
         .mockResolvedValue(swap);
       ChainSwapRepository.setUserLockupTransaction = jest
         .fn()
-        .mockResolvedValue(updatedSwap);
+        .mockResolvedValue({
+          outcome: LockupWriteOutcome.Acquired,
+          swap: updatedSwap,
+        });
 
       let emittedEvent: any = null;
       nursery.once('chainSwap.lockup.failed', (data) => {
@@ -935,7 +1029,7 @@ describe('ArkNursery', () => {
         swap,
         'txid',
         50000,
-        true,
+        SwapUpdateEvent.TransactionConfirmed,
         0,
         undefined,
       );
@@ -970,7 +1064,10 @@ describe('ArkNursery', () => {
         .mockResolvedValue(swap);
       ChainSwapRepository.setUserLockupTransaction = jest
         .fn()
-        .mockResolvedValue(updatedSwap);
+        .mockResolvedValue({
+          outcome: LockupWriteOutcome.Acquired,
+          swap: updatedSwap,
+        });
 
       const protector = new OverpaymentProtector(Logger.disabledLogger, {
         exemptAmount: 1000,
@@ -997,7 +1094,7 @@ describe('ArkNursery', () => {
         swap,
         'txid',
         150000,
-        true,
+        SwapUpdateEvent.TransactionConfirmed,
         0,
         undefined,
       );
@@ -1024,8 +1121,11 @@ describe('ArkNursery', () => {
       ChainSwapRepository.setUserLockupTransaction = jest
         .fn()
         .mockResolvedValue({
-          ...swap,
-          status: SwapUpdateEvent.TransactionLockupFailed,
+          outcome: LockupWriteOutcome.Idempotent,
+          swap: {
+            ...swap,
+            status: SwapUpdateEvent.TransactionLockupFailed,
+          },
         });
 
       const emitSpy = jest.spyOn(nursery, 'emit');
@@ -1041,7 +1141,7 @@ describe('ArkNursery', () => {
         swap,
         'txid',
         150000,
-        true,
+        SwapUpdateEvent.TransactionConfirmed,
         0,
         undefined,
       );
@@ -1083,7 +1183,10 @@ describe('ArkNursery', () => {
         .mockResolvedValue(swap);
       ChainSwapRepository.setUserLockupTransaction = jest
         .fn()
-        .mockResolvedValue(updatedSwap);
+        .mockResolvedValue({
+          outcome: LockupWriteOutcome.Acquired,
+          swap: updatedSwap,
+        });
 
       let emittedEvent: any = null;
       nursery.once('chainSwap.lockup', (data) => {
@@ -1105,7 +1208,7 @@ describe('ArkNursery', () => {
         swap,
         'txid',
         100000,
-        true,
+        SwapUpdateEvent.TransactionConfirmed,
         0,
         { allowLockupFailedUpdate: true },
       );
@@ -1138,7 +1241,10 @@ describe('ArkNursery', () => {
         .mockResolvedValue(swap);
       ChainSwapRepository.setUserLockupTransaction = jest
         .fn()
-        .mockResolvedValue(updatedSwap);
+        .mockResolvedValue({
+          outcome: LockupWriteOutcome.Acquired,
+          swap: updatedSwap,
+        });
 
       let emittedEvent: any = null;
       nursery.once('chainSwap.lockup', (data) => {
@@ -1159,7 +1265,7 @@ describe('ArkNursery', () => {
         swap,
         'txid',
         100000,
-        true,
+        SwapUpdateEvent.TransactionConfirmed,
         0,
         undefined,
       );

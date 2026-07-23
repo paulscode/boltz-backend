@@ -148,12 +148,22 @@ class Renegotiator {
             throw EthereumErrors.UNSUPPORTED_CONTRACT();
           }
 
-          const topicHash = (
-            isEther ? contracts.etherSwap : contracts.erc20Swap
-          ).interface.getEvent('Lockup').topicHash;
-          const lockupEvent = receipt.logs.find(
-            (log) => log.topics.length > 0 && log.topics[0] === topicHash,
+          const contract = isEther ? contracts.etherSwap : contracts.erc20Swap;
+          const topicHash = contract.interface.getEvent('Lockup').topicHash;
+          const contractAddress = (await contract.getAddress()).toLowerCase();
+          const lockupEvents = receipt.logs.filter(
+            (log) =>
+              log.topics.length > 0 &&
+              log.topics[0] === topicHash &&
+              log.address.toLowerCase() === contractAddress,
           );
+          const storedLogIndex = swap.receivingData.transactionVout;
+          const lockupEvent =
+            storedLogIndex != null
+              ? lockupEvents.find((log) => log.index === storedLogIndex)
+              : lockupEvents.length === 1
+                ? lockupEvents[0]
+                : undefined;
           if (lockupEvent === undefined) {
             throw Errors.LOCKUP_NOT_REJECTED();
           }
@@ -177,6 +187,7 @@ class Renegotiator {
               updatedSwap,
               transaction,
               formatEtherSwapValues(values),
+              lockupEvent.index,
               { allowLockupFailedUpdate: true },
             );
           } else {
@@ -190,6 +201,7 @@ class Renegotiator {
               updatedSwap,
               transaction,
               formatERC20SwapValues(values),
+              lockupEvent.index,
               { allowLockupFailedUpdate: true },
             );
           }

@@ -288,6 +288,7 @@ class Commitments {
         await this.eventHandler.handleEvent('eth.lockup', {
           transaction,
           version: contractVersion,
+          logIndex: event.logIndex,
           etherSwapValues: {
             amount: event.amount,
             claimAddress: event.claimAddress,
@@ -300,6 +301,7 @@ class Commitments {
         await this.eventHandler.handleEvent('erc20.lockup', {
           transaction,
           version: contractVersion,
+          logIndex: event.logIndex,
           erc20SwapValues: {
             amount: event.amount,
             claimAddress: event.claimAddress,

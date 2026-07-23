@@ -31,6 +31,7 @@ import {
   SwapUpdateEvent,
   SwapVersion,
 } from '../../../lib/consts/Enums';
+import { LockupWriteOutcome } from '../../../lib/db/LockupIdentity';
 import ChainSwapRepository from '../../../lib/db/repositories/ChainSwapRepository';
 import ClaimTransactionRepository from '../../../lib/db/repositories/ClaimTransactionRepository';
 import RefundTransactionRepository from '../../../lib/db/repositories/RefundTransactionRepository';
@@ -188,9 +189,15 @@ const mockGetSwapsExpirable = jest.fn().mockImplementation(async () => {
   return mockGetSwapsExpirableResult;
 });
 
-const mockSetLockupTransaction = jest
-  .fn()
-  .mockImplementation(async (arg) => arg);
+const mockSetLockupTransaction = jest.fn().mockImplementation(async (arg) => ({
+  outcome: LockupWriteOutcome.Acquired,
+  swap: arg,
+}));
+
+const mockSetZeroConfRejected = jest.fn().mockImplementation(async (arg) => ({
+  ...arg,
+  status: SwapUpdateEvent.TransactionZeroConfRejected,
+}));
 
 let mockGetReverseSwapResult: any = null;
 const mockGetReverseSwap = jest.fn().mockImplementation(async () => {
@@ -250,6 +257,7 @@ describe('UtxoNursery', () => {
     SwapRepository.getSwap = mockGetSwap;
     SwapRepository.getSwapsExpirable = mockGetSwapsExpirable;
     SwapRepository.setLockupTransaction = mockSetLockupTransaction;
+    SwapRepository.setZeroConfRejected = mockSetZeroConfRejected;
 
     ReverseSwapRepository.getReverseSwap = mockGetReverseSwap;
     ReverseSwapRepository.getReverseSwaps = mockGetReverseSwaps;
@@ -344,7 +352,7 @@ describe('UtxoNursery', () => {
       mockGetSwapResult,
       transaction.id,
       Number(transaction.getOutput(0).amount),
-      true,
+      SwapUpdateEvent.TransactionConfirmed,
       0,
     );
 
@@ -455,8 +463,11 @@ describe('UtxoNursery', () => {
         ),
       };
       mockSetLockupTransaction.mockResolvedValueOnce({
-        ...mockGetSwapResult,
-        status,
+        outcome: LockupWriteOutcome.Idempotent,
+        swap: {
+          ...mockGetSwapResult,
+          status,
+        },
       });
 
       const lockupListener = jest.fn();
@@ -473,6 +484,547 @@ describe('UtxoNursery', () => {
       expect(lockupListener).not.toHaveBeenCalled();
     },
   );
+
+  describe('competing lockup guard', () => {
+    const submarineSwap = (overrides: Record<string, any>) => {
+      const transaction = parseTx(sampleTransactions.lockup);
+      mockGetSwapResult = {
+        id: 'competing',
+        type: SwapType.Submarine,
+        redeemScript: sampleRedeemScript,
+        lockupAddress: encodeAddress(
+          Buffer.from(transaction.getOutput(0).script!),
+        ),
+        ...overrides,
+      };
+    };
+
+    test('should ignore a competing lockup once the recorded lockup is confirmed', async () => {
+      const checkSwapOutputs = nursery['checkOutputs'];
+      const transaction = parseTx(sampleTransactions.lockup);
+
+      submarineSwap({
+        expectedAmount: Number(transaction.getOutput(0).amount),
+        lockupTransactionId: 'already-recorded',
+        status: SwapUpdateEvent.TransactionConfirmed,
+      });
+
+      const lockupListener = jest.fn();
+      const failedListener = jest.fn();
+      nursery.on('swap.lockup', lockupListener);
+      nursery.on('swap.lockup.failed', failedListener);
+
+      await checkSwapOutputs(
+        btcChainClient,
+        btcWallet,
+        transaction,
+        TransactionStatus.Confirmed,
+      );
+
+      expect(mockSetLockupTransaction).not.toHaveBeenCalled();
+      expect(lockupListener).not.toHaveBeenCalled();
+      expect(failedListener).not.toHaveBeenCalled();
+    });
+
+    test('should ignore an insufficient competing lockup while unconfirmed', async () => {
+      const checkSwapOutputs = nursery['checkOutputs'];
+      const transaction = parseTx(sampleTransactions.lockup);
+
+      submarineSwap({
+        expectedAmount: Number(transaction.getOutput(0).amount) + 1,
+        lockupTransactionId: 'already-recorded',
+        status: SwapUpdateEvent.TransactionMempool,
+      });
+
+      const lockupListener = jest.fn();
+      const failedListener = jest.fn();
+      nursery.on('swap.lockup', lockupListener);
+      nursery.on('swap.lockup.failed', failedListener);
+
+      await checkSwapOutputs(
+        btcChainClient,
+        btcWallet,
+        transaction,
+        TransactionStatus.Confirmed,
+      );
+
+      expect(mockSetLockupTransaction).not.toHaveBeenCalled();
+      expect(lockupListener).not.toHaveBeenCalled();
+      expect(failedListener).not.toHaveBeenCalled();
+    });
+
+    test('should ignore a sufficient replacement while the recorded lockup is unconfirmed', async () => {
+      const checkSwapOutputs = nursery['checkOutputs'];
+      const transaction = parseTx(sampleTransactions.lockup);
+
+      submarineSwap({
+        expectedAmount: Number(transaction.getOutput(0).amount),
+        lockupTransactionId: 'to-be-replaced',
+        status: SwapUpdateEvent.TransactionMempool,
+      });
+
+      const lockupListener = jest.fn();
+      nursery.on('swap.lockup', lockupListener);
+
+      await checkSwapOutputs(
+        btcChainClient,
+        btcWallet,
+        transaction,
+        TransactionStatus.Confirmed,
+      );
+
+      expect(mockSetLockupTransaction).not.toHaveBeenCalled();
+      expect(lockupListener).not.toHaveBeenCalled();
+    });
+
+    test('should accept a replacement after the recorded lockup was rejected for zero-conf', async () => {
+      const checkSwapOutputs = nursery['checkOutputs'];
+      const transaction = parseTx(sampleTransactions.lockup);
+
+      submarineSwap({
+        expectedAmount: Number(transaction.getOutput(0).amount),
+        lockupTransactionId: 'rejected-lockup',
+        status: SwapUpdateEvent.TransactionZeroConfRejected,
+      });
+
+      const lockupListener = jest.fn();
+      nursery.on('swap.lockup', lockupListener);
+
+      await checkSwapOutputs(
+        btcChainClient,
+        btcWallet,
+        transaction,
+        TransactionStatus.Confirmed,
+      );
+
+      expect(mockSetLockupTransaction).toHaveBeenCalledTimes(1);
+      expect(lockupListener).toHaveBeenCalledTimes(1);
+    });
+
+    test('should accept the same lockup transaction transitioning to confirmed', async () => {
+      const checkSwapOutputs = nursery['checkOutputs'];
+      const transaction = parseTx(sampleTransactions.lockup);
+
+      submarineSwap({
+        expectedAmount: Number(transaction.getOutput(0).amount),
+        lockupTransactionId: transaction.id,
+        status: SwapUpdateEvent.TransactionMempool,
+      });
+
+      const lockupListener = jest.fn();
+      nursery.on('swap.lockup', lockupListener);
+
+      await checkSwapOutputs(
+        btcChainClient,
+        btcWallet,
+        transaction,
+        TransactionStatus.Confirmed,
+      );
+
+      expect(mockSetLockupTransaction).toHaveBeenCalledTimes(1);
+      expect(lockupListener).toHaveBeenCalledTimes(1);
+    });
+
+    test('should still fail a first insufficient lockup', async () => {
+      const checkSwapOutputs = nursery['checkOutputs'];
+      const transaction = parseTx(sampleTransactions.lockup);
+
+      submarineSwap({
+        expectedAmount: Number(transaction.getOutput(0).amount) + 1,
+        lockupTransactionId: undefined,
+        status: SwapUpdateEvent.SwapCreated,
+      });
+
+      const failedListener = jest.fn();
+      nursery.on('swap.lockup.failed', failedListener);
+
+      await checkSwapOutputs(
+        btcChainClient,
+        btcWallet,
+        transaction,
+        TransactionStatus.Confirmed,
+      );
+
+      expect(mockSetLockupTransaction).toHaveBeenCalledTimes(1);
+      expect(failedListener).toHaveBeenCalledTimes(1);
+    });
+
+    test('should ignore a competing lockup when the amount is not known yet', async () => {
+      const checkSwapOutputs = nursery['checkOutputs'];
+      const transaction = parseTx(sampleTransactions.lockup);
+
+      submarineSwap({
+        expectedAmount: undefined,
+        lockupTransactionId: 'already-recorded',
+        status: SwapUpdateEvent.TransactionMempool,
+      });
+
+      const lockupListener = jest.fn();
+      nursery.on('swap.lockup', lockupListener);
+
+      await checkSwapOutputs(
+        btcChainClient,
+        btcWallet,
+        transaction,
+        TransactionStatus.Confirmed,
+      );
+
+      expect(mockSetLockupTransaction).not.toHaveBeenCalled();
+      expect(lockupListener).not.toHaveBeenCalled();
+    });
+
+    const chainLockupTransaction = () => {
+      const ourKeys = makeKeys();
+      const theirPublicKey = Buffer.from(makeKeys().publicKey);
+      const tree = swapTree(
+        false,
+        randomBytes(32),
+        Buffer.from(ourKeys.publicKey),
+        theirPublicKey,
+        210,
+      );
+
+      const transaction = new Transaction();
+      transaction.addOutput({
+        script: Buffer.from(
+          Scripts.p2trOutput(
+            Buffer.from(
+              tweakMusig(
+                CurrencyType.BitcoinLike,
+                createMusig(ourKeys, theirPublicKey),
+                tree,
+              ).aggPubkey,
+            ),
+          ),
+        ),
+        amount: BigInt(123),
+      });
+
+      mockGetKeysByIndexResult = ourKeys;
+
+      return { transaction, theirPublicKey, tree };
+    };
+
+    const chainSwap = (
+      transaction: ReturnType<typeof chainLockupTransaction>,
+      receivingData: Record<string, any>,
+      status?: SwapUpdateEvent,
+    ) => ({
+      id: 'testChainSwap',
+      type: SwapType.Chain,
+      status,
+      receivingData: {
+        keyIndex: 123,
+        theirPublicKey: transaction.theirPublicKey.toString('hex'),
+        swapTree: JSON.stringify(
+          SwapTreeSerializer.serializeSwapTree(transaction.tree),
+        ),
+        ...receivingData,
+      },
+    });
+
+    test('should ignore a competing chain swap lockup once confirmed', async () => {
+      const checkChainSwapTransaction = nursery['checkChainSwapTransaction'];
+      const tx = chainLockupTransaction();
+      const mockChainSwap = chainSwap(
+        tx,
+        { expectedAmount: 123, transactionId: 'already-recorded' },
+        SwapUpdateEvent.TransactionConfirmed,
+      );
+
+      ChainSwapRepository.setUserLockupTransaction = jest
+        .fn()
+        .mockResolvedValue({
+          outcome: LockupWriteOutcome.Acquired,
+          swap: mockChainSwap,
+        });
+      const getOutputValueSpy = jest
+        .spyOn(Core, 'getOutputValue')
+        .mockReturnValue(123);
+
+      const lockupListener = jest.fn();
+      const failedListener = jest.fn();
+      nursery.on('chainSwap.lockup', lockupListener);
+      nursery.on('chainSwap.lockup.failed', failedListener);
+
+      await checkChainSwapTransaction(
+        mockChainSwap as any,
+        btcChainClient,
+        btcWallet,
+        tx.transaction,
+        TransactionStatus.Confirmed,
+      );
+
+      expect(
+        ChainSwapRepository.setUserLockupTransaction,
+      ).not.toHaveBeenCalled();
+      expect(lockupListener).not.toHaveBeenCalled();
+      expect(failedListener).not.toHaveBeenCalled();
+
+      getOutputValueSpy.mockRestore();
+    });
+
+    test('should ignore a sufficient chain swap replacement while unconfirmed', async () => {
+      const checkChainSwapTransaction = nursery['checkChainSwapTransaction'];
+      const tx = chainLockupTransaction();
+      const mockChainSwap = chainSwap(
+        tx,
+        { expectedAmount: 123, transactionId: 'to-be-replaced' },
+        SwapUpdateEvent.TransactionMempool,
+      );
+
+      ChainSwapRepository.setUserLockupTransaction = jest
+        .fn()
+        .mockResolvedValue({
+          outcome: LockupWriteOutcome.Acquired,
+          swap: mockChainSwap,
+        });
+      const getOutputValueSpy = jest
+        .spyOn(Core, 'getOutputValue')
+        .mockReturnValue(123);
+
+      const lockupListener = jest.fn();
+      nursery.on('chainSwap.lockup', lockupListener);
+
+      await checkChainSwapTransaction(
+        mockChainSwap as any,
+        btcChainClient,
+        btcWallet,
+        tx.transaction,
+        TransactionStatus.Confirmed,
+      );
+
+      expect(
+        ChainSwapRepository.setUserLockupTransaction,
+      ).not.toHaveBeenCalled();
+      expect(lockupListener).not.toHaveBeenCalled();
+
+      getOutputValueSpy.mockRestore();
+    });
+
+    test('should accept a chain swap replacement after zero-conf rejection', async () => {
+      const checkChainSwapTransaction = nursery['checkChainSwapTransaction'];
+      const tx = chainLockupTransaction();
+      const mockChainSwap = chainSwap(
+        tx,
+        { expectedAmount: 123, transactionId: 'rejected-lockup' },
+        SwapUpdateEvent.TransactionZeroConfRejected,
+      );
+
+      ChainSwapRepository.setUserLockupTransaction = jest
+        .fn()
+        .mockResolvedValue({
+          outcome: LockupWriteOutcome.Acquired,
+          swap: mockChainSwap,
+        });
+      const getOutputValueSpy = jest
+        .spyOn(Core, 'getOutputValue')
+        .mockReturnValue(123);
+
+      const lockupListener = jest.fn();
+      nursery.on('chainSwap.lockup', lockupListener);
+
+      await checkChainSwapTransaction(
+        mockChainSwap as any,
+        btcChainClient,
+        btcWallet,
+        tx.transaction,
+        TransactionStatus.Confirmed,
+      );
+
+      expect(
+        ChainSwapRepository.setUserLockupTransaction,
+      ).toHaveBeenCalledTimes(1);
+      expect(lockupListener).toHaveBeenCalledTimes(1);
+
+      getOutputValueSpy.mockRestore();
+    });
+
+    test('should allow re-pointing a failed chain swap lockup when the renegotiation override is set', async () => {
+      const checkChainSwapTransaction = nursery['checkChainSwapTransaction'];
+      const tx = chainLockupTransaction();
+      const mockChainSwap = chainSwap(
+        tx,
+        { expectedAmount: 123, transactionId: 'already-recorded' },
+        SwapUpdateEvent.TransactionLockupFailed,
+      );
+
+      ChainSwapRepository.setUserLockupTransaction = jest
+        .fn()
+        .mockResolvedValue({
+          outcome: LockupWriteOutcome.Acquired,
+          swap: mockChainSwap,
+        });
+      const getOutputValueSpy = jest
+        .spyOn(Core, 'getOutputValue')
+        .mockReturnValue(123);
+
+      const lockupListener = jest.fn();
+      nursery.on('chainSwap.lockup', lockupListener);
+
+      await checkChainSwapTransaction(
+        mockChainSwap as any,
+        btcChainClient,
+        btcWallet,
+        tx.transaction,
+        TransactionStatus.Confirmed,
+        { allowLockupFailedUpdate: true },
+      );
+
+      expect(
+        ChainSwapRepository.setUserLockupTransaction,
+      ).toHaveBeenCalledTimes(1);
+      expect(lockupListener).toHaveBeenCalledTimes(1);
+
+      getOutputValueSpy.mockRestore();
+    });
+
+    test('should reject chain swap zero-conf through the guarded status write', async () => {
+      const checkChainSwapTransaction = nursery['checkChainSwapTransaction'];
+      const tx = chainLockupTransaction();
+      const mockChainSwap = chainSwap(
+        tx,
+        { expectedAmount: 123 },
+        SwapUpdateEvent.SwapCreated,
+      );
+
+      ChainSwapRepository.setUserLockupTransaction = jest
+        .fn()
+        .mockResolvedValue({
+          outcome: LockupWriteOutcome.Acquired,
+          swap: mockChainSwap,
+        });
+      const setZeroConfRejected = jest.fn().mockImplementation(async (arg) => ({
+        ...arg,
+        status: SwapUpdateEvent.TransactionZeroConfRejected,
+      }));
+      ChainSwapRepository.setZeroConfRejected = setZeroConfRejected;
+      const getOutputValueSpy = jest
+        .spyOn(Core, 'getOutputValue')
+        .mockReturnValue(123);
+
+      const rejectedListener = jest.fn();
+      const lockupListener = jest.fn();
+      nursery.on('chainSwap.lockup.zeroconf.rejected', rejectedListener);
+      nursery.on('chainSwap.lockup', lockupListener);
+
+      await checkChainSwapTransaction(
+        mockChainSwap as any,
+        btcChainClient,
+        btcWallet,
+        tx.transaction,
+        TransactionStatus.ZeroConfSafe,
+      );
+
+      expect(setZeroConfRejected).toHaveBeenCalledTimes(1);
+      expect(setZeroConfRejected).toHaveBeenCalledWith(
+        mockChainSwap,
+        tx.transaction.id,
+        0,
+      );
+      expect(rejectedListener).toHaveBeenCalledTimes(1);
+      expect(rejectedListener).toHaveBeenCalledWith({
+        transaction: tx.transaction,
+        swap: {
+          ...mockChainSwap,
+          status: SwapUpdateEvent.TransactionZeroConfRejected,
+        },
+        reason: Errors.SWAP_DOES_NOT_ACCEPT_ZERO_CONF().message,
+      });
+      expect(lockupListener).not.toHaveBeenCalled();
+
+      getOutputValueSpy.mockRestore();
+    });
+
+    test('should not emit a chain swap zero-conf rejection when the status write was refused', async () => {
+      const checkChainSwapTransaction = nursery['checkChainSwapTransaction'];
+      const tx = chainLockupTransaction();
+      const mockChainSwap = chainSwap(
+        tx,
+        { expectedAmount: 123 },
+        SwapUpdateEvent.SwapCreated,
+      );
+
+      ChainSwapRepository.setUserLockupTransaction = jest
+        .fn()
+        .mockResolvedValue({
+          outcome: LockupWriteOutcome.Acquired,
+          swap: mockChainSwap,
+        });
+      const setZeroConfRejected = jest.fn().mockImplementation(async (arg) => ({
+        ...arg,
+        status: SwapUpdateEvent.TransactionConfirmed,
+      }));
+      ChainSwapRepository.setZeroConfRejected = setZeroConfRejected;
+      const getOutputValueSpy = jest
+        .spyOn(Core, 'getOutputValue')
+        .mockReturnValue(123);
+
+      const rejectedListener = jest.fn();
+      const lockupListener = jest.fn();
+      nursery.on('chainSwap.lockup.zeroconf.rejected', rejectedListener);
+      nursery.on('chainSwap.lockup', lockupListener);
+
+      await checkChainSwapTransaction(
+        mockChainSwap as any,
+        btcChainClient,
+        btcWallet,
+        tx.transaction,
+        TransactionStatus.ZeroConfSafe,
+      );
+
+      expect(setZeroConfRejected).toHaveBeenCalledTimes(1);
+      expect(rejectedListener).not.toHaveBeenCalled();
+      expect(lockupListener).not.toHaveBeenCalled();
+
+      getOutputValueSpy.mockRestore();
+    });
+
+    test('should emit an unconfirmed chain swap lockup when zero-conf is accepted', async () => {
+      const checkChainSwapTransaction = nursery['checkChainSwapTransaction'];
+      const tx = chainLockupTransaction();
+      const mockChainSwap = {
+        ...chainSwap(tx, { expectedAmount: 123 }, SwapUpdateEvent.SwapCreated),
+        acceptZeroConf: true,
+      };
+
+      ChainSwapRepository.setUserLockupTransaction = jest
+        .fn()
+        .mockResolvedValue({
+          outcome: LockupWriteOutcome.Acquired,
+          swap: mockChainSwap,
+        });
+      const setZeroConfRejected = jest.fn();
+      ChainSwapRepository.setZeroConfRejected = setZeroConfRejected;
+      const getOutputValueSpy = jest
+        .spyOn(Core, 'getOutputValue')
+        .mockReturnValue(123);
+
+      const rejectedListener = jest.fn();
+      const lockupListener = jest.fn();
+      nursery.on('chainSwap.lockup.zeroconf.rejected', rejectedListener);
+      nursery.on('chainSwap.lockup', lockupListener);
+
+      await checkChainSwapTransaction(
+        mockChainSwap as any,
+        btcChainClient,
+        btcWallet,
+        tx.transaction,
+        TransactionStatus.ZeroConfSafe,
+      );
+
+      expect(setZeroConfRejected).not.toHaveBeenCalled();
+      expect(rejectedListener).not.toHaveBeenCalled();
+      expect(lockupListener).toHaveBeenCalledTimes(1);
+      expect(lockupListener).toHaveBeenCalledWith({
+        swap: mockChainSwap,
+        transaction: tx.transaction,
+        confirmed: false,
+      });
+
+      getOutputValueSpy.mockRestore();
+    });
+  });
 
   test('should handle unconfirmed Swap outputs', async () => {
     const checkSwapOutputs = nursery['checkOutputs'];
@@ -529,7 +1081,10 @@ describe('UtxoNursery', () => {
     lockupTracker.isAcceptable = jest.fn().mockResolvedValue(false);
 
     nursery.once('swap.lockup.zeroconf.rejected', (args) => {
-      expect(args.swap).toEqual(mockGetSwapResult);
+      expect(args.swap).toEqual({
+        ...mockGetSwapResult,
+        status: SwapUpdateEvent.TransactionZeroConfRejected,
+      });
       expect(args.transaction).toEqual(transaction);
       expect(args.reason).toEqual(
         Errors.SWAP_DOES_NOT_ACCEPT_ZERO_CONF().message,
@@ -557,7 +1112,10 @@ describe('UtxoNursery', () => {
     mockGetSwapResult.acceptZeroConf = null;
 
     nursery.once('swap.lockup.zeroconf.rejected', (args) => {
-      expect(args.swap).toEqual(mockGetSwapResult);
+      expect(args.swap).toEqual({
+        ...mockGetSwapResult,
+        status: SwapUpdateEvent.TransactionZeroConfRejected,
+      });
       expect(args.transaction).toEqual(transaction);
       expect(args.reason).toEqual(
         Errors.SWAP_DOES_NOT_ACCEPT_ZERO_CONF().message,
@@ -591,7 +1149,10 @@ describe('UtxoNursery', () => {
     rbfTransaction.updateInput(0, { sequence: 0xffffffff - 2 }, true);
 
     nursery.once('swap.lockup.zeroconf.rejected', (args) => {
-      expect(args.swap).toEqual(mockGetSwapResult);
+      expect(args.swap).toEqual({
+        ...mockGetSwapResult,
+        status: SwapUpdateEvent.TransactionZeroConfRejected,
+      });
       expect(args.transaction).toEqual(rbfTransaction);
       expect(args.reason).toEqual(
         Errors.LOCKUP_TRANSACTION_SIGNALS_RBF().message,
@@ -707,6 +1268,46 @@ describe('UtxoNursery', () => {
     expect(mockSetLockupTransaction).not.toHaveBeenCalled();
   });
 
+  test('should not emit a zero-conf rejection when the status write was refused', async () => {
+    const transaction = parseTx(sampleTransactions.lockup);
+    transaction.updateInput(0, { sequence: 0xffffffff }, true);
+    transaction.updateInput(1, { sequence: 0xffffffff }, true);
+
+    mockGetSwapResult = {
+      id: '0conf',
+      acceptZeroConf: true,
+      redeemScript: sampleRedeemScript,
+      type: SwapType.Submarine,
+      lockupAddress: encodeAddress(
+        Buffer.from(transaction.getOutput(0).script!),
+      ),
+    };
+
+    mockSetZeroConfRejected.mockImplementationOnce(async (arg) => ({
+      ...arg,
+      status: SwapUpdateEvent.TransactionConfirmed,
+    }));
+    lockupTracker.zeroConfAccepted = jest.fn().mockReturnValue(false);
+
+    const rejectedListener = jest.fn();
+    nursery.on('swap.lockup.zeroconf.rejected', rejectedListener);
+
+    await nursery['checkOutputs'](
+      btcChainClient,
+      btcWallet,
+      transaction,
+      TransactionStatus.ZeroConfSafe,
+    );
+
+    expect(mockSetZeroConfRejected).toHaveBeenCalledTimes(1);
+    expect(mockSetZeroConfRejected).toHaveBeenCalledWith(
+      mockGetSwapResult,
+      transaction.id,
+      expect.any(Number),
+    );
+    expect(rejectedListener).not.toHaveBeenCalled();
+  });
+
   test('should detect Taproot Swap outputs', async () => {
     const checkSwapOutputs = nursery['checkOutputs'];
 
@@ -762,7 +1363,7 @@ describe('UtxoNursery', () => {
       expect.anything(),
       transaction.id,
       Number(transaction.getOutput(0).amount),
-      true,
+      SwapUpdateEvent.TransactionConfirmed,
       0,
     );
     expect(mockGetKeysByIndex).toHaveBeenCalledTimes(1);
@@ -1805,8 +2406,11 @@ describe('UtxoNursery', () => {
         };
 
         mockSetLockupTransaction.mockImplementationOnce(async (swap) => ({
-          ...swap,
-          expectedAmount,
+          outcome: LockupWriteOutcome.Acquired,
+          swap: {
+            ...swap,
+            expectedAmount,
+          },
         }));
 
         const getOutputValueSpy = jest
@@ -1911,7 +2515,10 @@ describe('UtxoNursery', () => {
 
         ChainSwapRepository.setUserLockupTransaction = jest
           .fn()
-          .mockResolvedValue(mockChainSwap);
+          .mockResolvedValue({
+            outcome: LockupWriteOutcome.Acquired,
+            swap: mockChainSwap,
+          });
 
         const getOutputValueSpy = jest
           .spyOn(Core, 'getOutputValue')
@@ -1945,7 +2552,7 @@ describe('UtxoNursery', () => {
           mockChainSwap,
           transaction.id,
           outputValue,
-          true,
+          SwapUpdateEvent.TransactionConfirmed,
           0,
           undefined,
         );
@@ -2000,8 +2607,11 @@ describe('UtxoNursery', () => {
       ChainSwapRepository.setUserLockupTransaction = jest
         .fn()
         .mockResolvedValue({
-          ...mockChainSwap,
-          status: SwapUpdateEvent.TransactionLockupFailed,
+          outcome: LockupWriteOutcome.Idempotent,
+          swap: {
+            ...mockChainSwap,
+            status: SwapUpdateEvent.TransactionLockupFailed,
+          },
         });
 
       const getOutputValueSpy = jest
@@ -2022,7 +2632,7 @@ describe('UtxoNursery', () => {
         mockChainSwap,
         transaction.id,
         500,
-        true,
+        SwapUpdateEvent.TransactionConfirmed,
         0,
         undefined,
       );

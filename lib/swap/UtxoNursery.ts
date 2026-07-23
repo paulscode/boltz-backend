@@ -1,11 +1,6 @@
 import { sha256 } from '@noble/hashes/sha2.js';
 import type { Transaction } from '@scure/btc-signer';
-import {
-  Scripts,
-  SwapTreeSerializer,
-  detectPreimage,
-  detectSwap,
-} from 'boltz-core';
+import { Scripts, SwapTreeSerializer, detectSwap } from 'boltz-core';
 import type { Transaction as LiquidTransaction } from 'liquidjs-lib';
 import { Op } from 'sequelize';
 import {
@@ -30,6 +25,7 @@ import {
   swapTypeToPrettyString,
 } from '../consts/Enums';
 import TypedEventEmitter from '../consts/TypedEventEmitter';
+import { LockupWriteOutcome } from '../db/LockupIdentity';
 import type ReverseSwap from '../db/models/ReverseSwap';
 import type Swap from '../db/models/Swap';
 import type {
@@ -47,6 +43,7 @@ import { TransactionStatus } from '../sidecar/Sidecar';
 import type Wallet from '../wallet/Wallet';
 import type { Currency } from '../wallet/WalletManager';
 import type WalletManager from '../wallet/WalletManager';
+import { shouldIgnoreCompetingLockup } from './CompetingLockup';
 import Errors from './Errors';
 import type OverpaymentProtector from './OverpaymentProtector';
 import { Action } from './hooks/CreationHook';
@@ -166,14 +163,39 @@ class UtxoNursery extends TypedEventEmitter<{
       wallet,
       swapOutput as Parameters<typeof getOutputValue>[1],
     );
-    swap = await ChainSwapRepository.setUserLockupTransaction(
+
+    if (
+      shouldIgnoreCompetingLockup({
+        prevId: swap.receivingData.transactionId,
+        prevVout: swap.receivingData.transactionVout,
+        incomingId: TxView.of(transaction).id,
+        incomingVout: swapOutput.vout,
+        recordedStatus: swap.status as SwapUpdateEvent,
+      })
+    ) {
+      this.logger.debug(
+        `Ignoring competing lockup transaction ${TxView.of(transaction).id} of ${swapTypeToPrettyString(swap.type)} Swap ${swap.id}`,
+      );
+      return;
+    }
+
+    const lockupResult = await ChainSwapRepository.setUserLockupTransaction(
       swap,
       TxView.of(transaction).id,
       outputValue,
-      status === TransactionStatus.Confirmed,
+      status === TransactionStatus.Confirmed
+        ? SwapUpdateEvent.TransactionConfirmed
+        : SwapUpdateEvent.TransactionMempool,
       swapOutput.vout,
       options,
     );
+    if (lockupResult.outcome === LockupWriteOutcome.Rejected) {
+      this.logger.debug(
+        `Ignoring lockup transaction ${TxView.of(transaction).id} of ${swapTypeToPrettyString(swap.type)} Swap ${swap.id} because another lockup owns it`,
+      );
+      return;
+    }
+    swap = lockupResult.swap;
 
     if (!ChainSwapRepository.canActOnUserLockup(swap, options)) {
       this.logger.debug(
@@ -249,11 +271,20 @@ class UtxoNursery extends TypedEventEmitter<{
         status,
       );
       if (zeroConfRejectedReason !== undefined) {
-        this.emit('chainSwap.lockup.zeroconf.rejected', {
+        const rejectedSwap = await ChainSwapRepository.setZeroConfRejected(
           swap,
-          transaction,
-          reason: zeroConfRejectedReason,
-        });
+          TxView.of(transaction).id,
+          swapOutput.vout,
+        );
+        if (
+          rejectedSwap.status === SwapUpdateEvent.TransactionZeroConfRejected
+        ) {
+          this.emit('chainSwap.lockup.zeroconf.rejected', {
+            transaction,
+            swap: rejectedSwap,
+            reason: zeroConfRejectedReason,
+          });
+        }
         return;
       }
 
@@ -707,13 +738,38 @@ class UtxoNursery extends TypedEventEmitter<{
       wallet,
       swapOutput as Parameters<typeof getOutputValue>[1],
     );
-    const updatedSwap = await SwapRepository.setLockupTransaction(
+
+    if (
+      shouldIgnoreCompetingLockup({
+        prevId: swap.lockupTransactionId,
+        prevVout: swap.lockupTransactionVout,
+        incomingId: TxView.of(transaction).id,
+        incomingVout: swapOutput.vout,
+        recordedStatus: swap.status as SwapUpdateEvent,
+      })
+    ) {
+      this.logger.debug(
+        `Ignoring competing lockup transaction ${TxView.of(transaction).id} of ${swapTypeToPrettyString(swap.type)} Swap ${swap.id}`,
+      );
+      return;
+    }
+
+    const lockupResult = await SwapRepository.setLockupTransaction(
       swap,
       TxView.of(transaction).id,
       outputValue,
-      status === TransactionStatus.Confirmed,
+      status === TransactionStatus.Confirmed
+        ? SwapUpdateEvent.TransactionConfirmed
+        : SwapUpdateEvent.TransactionMempool,
       swapOutput.vout,
     );
+    if (lockupResult.outcome === LockupWriteOutcome.Rejected) {
+      this.logger.debug(
+        `Ignoring lockup transaction ${TxView.of(transaction).id} of ${swapTypeToPrettyString(swap.type)} Swap ${swap.id} because another lockup owns it`,
+      );
+      return;
+    }
+    const updatedSwap = lockupResult.swap;
 
     if (
       SwapRepository.lockupNonUpdatableStatuses.includes(
@@ -796,11 +852,20 @@ class UtxoNursery extends TypedEventEmitter<{
         status,
       );
       if (zeroConfRejectedReason !== undefined) {
-        this.emit('swap.lockup.zeroconf.rejected', {
-          transaction,
-          swap: updatedSwap,
-          reason: zeroConfRejectedReason,
-        });
+        const rejectedSwap = await SwapRepository.setZeroConfRejected(
+          updatedSwap,
+          TxView.of(transaction).id,
+          swapOutput.vout,
+        );
+        if (
+          rejectedSwap.status === SwapUpdateEvent.TransactionZeroConfRejected
+        ) {
+          this.emit('swap.lockup.zeroconf.rejected', {
+            transaction,
+            swap: rejectedSwap,
+            reason: zeroConfRejectedReason,
+          });
+        }
         return;
       }
 

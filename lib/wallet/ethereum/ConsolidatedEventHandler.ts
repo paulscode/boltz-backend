@@ -1,9 +1,7 @@
-import { createHash } from 'crypto';
 import InstrumentedLock from '../../InstrumentedLock';
 import type Logger from '../../Logger';
 import { mapConcurrent, stringify } from '../../Utils';
 import TypedEventEmitter from '../../consts/TypedEventEmitter';
-import type { ERC20SwapValues, EtherSwapValues } from '../../consts/Types';
 import type { NetworkDetails } from './EvmNetworks';
 import type InjectedProvider from './InjectedProvider';
 import type { Events } from './contracts/ContractEventHandler';
@@ -19,28 +17,8 @@ type PendingEvent = {
   event: LockupEventEntry;
 };
 
-const hashSwapValues = (values: EtherSwapValues | ERC20SwapValues): string => {
-  const h = createHash('sha256');
-  h.update(values.preimageHash);
-  h.update(values.amount.toString());
-  h.update(values.claimAddress);
-  h.update(values.refundAddress);
-  h.update(values.timelock.toString());
-
-  if ('tokenAddress' in values) {
-    h.update(values.tokenAddress);
-  }
-
-  return h.digest('hex');
-};
-
-const pendingEventKey = (pending: PendingEvent): string => {
-  const values =
-    pending.event.name === 'eth.lockup'
-      ? pending.event.payload.etherSwapValues
-      : pending.event.payload.erc20SwapValues;
-  return `${pending.event.name}:${pending.txHash}:${hashSwapValues(values)}`;
-};
+const pendingEventKey = (pending: PendingEvent): string =>
+  `${pending.event.name}:${pending.txHash}:${pending.event.payload.logIndex}`;
 
 const enum QueueAction {
   Queue = 0,

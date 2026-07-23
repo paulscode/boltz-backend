@@ -196,6 +196,92 @@ describe('ContractUtils', () => {
     });
   });
 
+  describe('multiple lockups in one transaction', () => {
+    const multiLockTransactionHash = '0xmulti';
+
+    const multiLockProvider = async (amounts: bigint[]) => {
+      const address = await etherSwap.getAddress();
+      const logs = amounts.map((amount, i) => {
+        const encoded = etherSwap.interface.encodeEventLog('Lockup', [
+          etherSwapValues.preimageHash,
+          amount,
+          etherSwapValues.claimAddress,
+          etherSwapValues.refundAddress,
+          etherSwapValues.timelock,
+        ]);
+        return {
+          address,
+          topics: encoded.topics,
+          data: encoded.data,
+          index: i + 1,
+        };
+      });
+
+      return {
+        getTransactionReceipt: async () => ({ logs }),
+      } as any;
+    };
+
+    beforeEach(() => {
+      getBySwapIdSpy.mockResolvedValue(null as any);
+    });
+
+    test('should resolve the exact lockup by logIndex', async () => {
+      const values = await queryEtherSwapValuesFromLock(
+        swap,
+        await multiLockProvider([1n, 999n]),
+        etherSwap,
+        multiLockTransactionHash,
+        true,
+        2,
+      );
+
+      expect(values.amount).toEqual(999n);
+    });
+
+    test('should fail closed without a logIndex when multiple lockups match the preimageHash', async () => {
+      await expect(
+        queryEtherSwapValuesFromLock(
+          swap,
+          await multiLockProvider([1n, 999n]),
+          etherSwap,
+          multiLockTransactionHash,
+          true,
+        ),
+      ).rejects.toEqual(
+        Errors.INVALID_LOCKUP_TRANSACTION(multiLockTransactionHash),
+      );
+    });
+
+    test('should fail closed when the logIndex is stale and multiple lockups match', async () => {
+      await expect(
+        queryEtherSwapValuesFromLock(
+          swap,
+          await multiLockProvider([1n, 999n]),
+          etherSwap,
+          multiLockTransactionHash,
+          true,
+          99,
+        ),
+      ).rejects.toEqual(
+        Errors.INVALID_LOCKUP_TRANSACTION(multiLockTransactionHash),
+      );
+    });
+
+    test('should fall back to a unique match when the logIndex is stale', async () => {
+      const values = await queryEtherSwapValuesFromLock(
+        swap,
+        await multiLockProvider([999n]),
+        etherSwap,
+        multiLockTransactionHash,
+        true,
+        99,
+      );
+
+      expect(values.amount).toEqual(999n);
+    });
+  });
+
   describe('with lockupHash identifier', () => {
     test('should query EtherSwap values by lockupHash', async () => {
       getBySwapIdSpy.mockResolvedValue({

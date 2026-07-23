@@ -1472,9 +1472,14 @@ describe('SwapNursery', () => {
           expectedAmount: 100_000,
           symbol: 'BTC',
         },
+        receivingData: {
+          transactionId: 'chain-lockup-transaction',
+        },
       } as unknown as ChainSwapInfo;
 
-      mockTransaction = {};
+      mockTransaction = {
+        getId: jest.fn().mockReturnValue('chain-lockup-transaction'),
+      };
 
       mockHandleChainSwapLockup = jest
         .spyOn(swapNursery as any, 'handleChainSwapLockup')
@@ -1630,6 +1635,35 @@ describe('SwapNursery', () => {
       );
     });
 
+    test('should not lock up when the recorded lockup does not match the event transaction', async () => {
+      mockGetChainSwapResult = {
+        ...baseMockChainSwap,
+        receivingData: {
+          transactionId: 'other-lockup-transaction',
+        },
+      };
+
+      (swapNursery as any).utxoNursery.emit('chainSwap.lockup', {
+        swap: baseMockChainSwap,
+        transaction: mockTransaction,
+        confirmed: true,
+      });
+
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      expect(mockLogger.warn).toHaveBeenCalledWith(
+        expect.stringContaining('because other-lockup-transaction owns it'),
+      );
+      expect(mockHandleChainSwapLockup).not.toHaveBeenCalled();
+      expect(swapNursery.emit).not.toHaveBeenCalledWith(
+        'transaction',
+        expect.anything(),
+      );
+      expect(SendApprovalHoldRepository.remove).toHaveBeenCalledWith(
+        baseMockChainSwap.id,
+      );
+    });
+
     test('should not lock up when the chain swap becomes final while approval is pending', async () => {
       mockGetChainSwapResult = baseMockChainSwap;
       let resolveApproval!: (action: SendApprovalAction) => void;
@@ -1768,6 +1802,53 @@ describe('SwapNursery', () => {
       );
     });
 
+    test('should not lock up the chain swap when the recorded lockup does not match the event transaction', async () => {
+      const listeners: Record<string, (...args: any[]) => Promise<void>> = {};
+      const ethereumNursery = {
+        on: jest.fn(
+          (event: string, callback: (...args: any[]) => Promise<void>) => {
+            listeners[event] = callback;
+          },
+        ),
+        init: jest.fn().mockResolvedValue(undefined),
+      } as any;
+
+      const chainSwap = {
+        id: 'test-chain-swap-id',
+        pair: 'BTC/BTC',
+        type: SwapType.Chain,
+        status: SwapUpdateEvent.SwapCreated,
+        sendingData: {
+          transactionId: null,
+          expectedAmount: 100_000,
+          symbol: 'BTC',
+        },
+        receivingData: {
+          transactionId: '0xother-owner',
+        },
+      } as unknown as ChainSwapInfo;
+      mockGetChainSwapResult = chainSwap;
+      const mockHandleChainSwapLockup = jest
+        .spyOn(swapNursery as any, 'handleChainSwapLockup')
+        .mockResolvedValue(undefined);
+      jest.spyOn(swapNursery, 'emit');
+
+      await (swapNursery as any).listenEthereumNursery(ethereumNursery);
+      await listeners['eth.lockup']({
+        swap: chainSwap,
+        transactionHash: '0xevent',
+      });
+
+      expect(mockLogger.warn).toHaveBeenCalledWith(
+        expect.stringContaining('because 0xother-owner owns it'),
+      );
+      expect(mockHandleChainSwapLockup).not.toHaveBeenCalled();
+      expect(swapNursery.emit).not.toHaveBeenCalledWith(
+        'transaction',
+        expect.anything(),
+      );
+    });
+
     test('should thread the resolved approval into the chain lockup', async () => {
       const listeners: Record<string, (...args: any[]) => Promise<void>> = {};
       const ethereumNursery = {
@@ -1788,6 +1869,9 @@ describe('SwapNursery', () => {
           transactionId: null,
           expectedAmount: 100_000,
           symbol: 'BTC',
+        },
+        receivingData: {
+          transactionId: '0xaccept',
         },
       } as unknown as ChainSwapInfo;
       mockGetChainSwapResult = chainSwap;
@@ -1838,6 +1922,9 @@ describe('SwapNursery', () => {
           expectedAmount: 100_000,
           symbol: 'BTC',
         },
+        receivingData: {
+          transactionId: '0xhold',
+        },
       } as unknown as ChainSwapInfo;
       mockGetChainSwapResult = chainSwap;
       (swapNursery as any).sendApprovalHook = {
@@ -1878,6 +1965,7 @@ describe('SwapNursery', () => {
         orderSide: OrderSide.BUY,
         invoice: 'lnbcrt1',
         createdRefundSignature: false,
+        lockupTransactionId: '0xsubmarine',
       } as unknown as Swap;
       mockGetSwapResult = submarineSwap;
       (swapNursery as any).sendApprovalHook = { hook: jest.fn() };
@@ -1898,6 +1986,47 @@ describe('SwapNursery', () => {
         submarineSwap,
       );
     });
+
+    test('should not pay when the recorded lockup does not match the event transaction', async () => {
+      const listeners: Record<string, (...args: any[]) => Promise<void>> = {};
+      const ethereumNursery = {
+        on: jest.fn(
+          (event: string, callback: (...args: any[]) => Promise<void>) => {
+            listeners[event] = callback;
+          },
+        ),
+        init: jest.fn().mockResolvedValue(undefined),
+      } as any;
+
+      const submarineSwap = {
+        id: 'submarine-swap-id',
+        pair: 'BTC/BTC',
+        type: SwapType.Submarine,
+        orderSide: OrderSide.BUY,
+        invoice: 'lnbcrt1',
+        createdRefundSignature: false,
+        lockupTransactionId: '0xother-owner',
+      } as unknown as Swap;
+      mockGetSwapResult = submarineSwap;
+      const attemptSettleSwapSpy = jest
+        .spyOn(swapNursery, 'attemptSettleSwap')
+        .mockResolvedValue(undefined);
+      const emitSpy = jest.spyOn(swapNursery, 'emit');
+
+      await (swapNursery as any).listenEthereumNursery(ethereumNursery);
+      await listeners['eth.lockup']({
+        swap: submarineSwap,
+        transactionHash: '0xsubmarine',
+      });
+
+      expect(attemptSettleSwapSpy).not.toHaveBeenCalled();
+      expect(emitSpy).not.toHaveBeenCalledWith(
+        'transaction',
+        expect.anything(),
+      );
+
+      emitSpy.mockRestore();
+    });
   });
 
   describe('swap.lockup', () => {
@@ -1915,9 +2044,13 @@ describe('SwapNursery', () => {
         orderSide: OrderSide.BUY,
         createdRefundSignature: false,
         invoice: 'lnbc123...',
+        lockupTransactionId: 'event-owner',
+        lockupTransactionVout: 0,
       };
 
-      mockTransaction = {};
+      mockTransaction = {
+        getId: jest.fn().mockReturnValue('event-owner'),
+      };
 
       mockPayInvoice = jest
         .spyOn(swapNursery as any, 'payInvoice')
@@ -2030,6 +2163,33 @@ describe('SwapNursery', () => {
       );
     });
 
+    test('should not act when the event transaction no longer owns the swap', async () => {
+      mockGetSwapResult = {
+        ...baseMockSwap,
+        lockupTransactionId: 'different-owner',
+        lockupTransactionVout: 1,
+      };
+
+      (swapNursery as any).utxoNursery.emit('swap.lockup', {
+        swap: baseMockSwap,
+        transaction: mockTransaction,
+        confirmed: false,
+      });
+
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      expect(mockLogger.warn).toHaveBeenCalledWith(
+        expect.stringContaining('different-owner:1 owns it'),
+      );
+      expect(mockPayInvoice).not.toHaveBeenCalled();
+      expect(mockClaimUtxo).not.toHaveBeenCalled();
+      expect(mockSetSwapRate).not.toHaveBeenCalled();
+      expect(swapNursery.emit).not.toHaveBeenCalledWith(
+        'transaction',
+        expect.anything(),
+      );
+    });
+
     test('should prevent invoice payment when createdRefundSignature is true', async () => {
       mockGetSwapResult = {
         ...baseMockSwap,
@@ -2106,6 +2266,105 @@ describe('SwapNursery', () => {
       await new Promise((resolve) => setTimeout(resolve, 50));
 
       expect(mockPayInvoice).toHaveBeenCalled();
+    });
+  });
+
+  describe('zeroconf rejected', () => {
+    let mockTransaction: any;
+
+    beforeEach(async () => {
+      mockTransaction = {
+        getId: jest.fn().mockReturnValue('rejected-lockup'),
+      };
+
+      jest.spyOn(swapNursery, 'emit');
+
+      await swapNursery.init([mockCurrency]);
+    });
+
+    afterEach(() => {
+      jest.clearAllMocks();
+    });
+
+    test('should re-emit swap zero-conf rejections without writing the status', async () => {
+      const mockSwap = {
+        id: 'zeroconf-swap',
+        type: SwapType.Submarine,
+        invoice: 'lnbc123...',
+        lockupTransactionId: 'rejected-lockup',
+        lockupTransactionVout: 0,
+        status: SwapUpdateEvent.TransactionZeroConfRejected,
+      } as any;
+
+      (swapNursery as any).utxoNursery.emit('swap.lockup.zeroconf.rejected', {
+        swap: mockSwap,
+        transaction: mockTransaction,
+        reason: 'greedy fees',
+      });
+
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      expect(swapNursery.emit).toHaveBeenCalledWith('zeroconf.rejected', {
+        transaction: mockTransaction,
+        swap: mockSwap,
+      });
+      expect(SwapRepository.setSwapStatus).not.toHaveBeenCalled();
+    });
+
+    test('should set the swap rate for rejected swaps without an invoice', async () => {
+      const mockSetSwapRate = jest
+        .spyOn(swapNursery as any, 'setSwapRate')
+        .mockResolvedValue(undefined);
+
+      const mockSwap = {
+        id: 'zeroconf-swap-no-invoice',
+        type: SwapType.Submarine,
+        invoice: null,
+        lockupTransactionId: 'rejected-lockup',
+        lockupTransactionVout: 0,
+        status: SwapUpdateEvent.TransactionZeroConfRejected,
+      } as any;
+
+      (swapNursery as any).utxoNursery.emit('swap.lockup.zeroconf.rejected', {
+        swap: mockSwap,
+        transaction: mockTransaction,
+        reason: 'greedy fees',
+      });
+
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      expect(mockSetSwapRate).toHaveBeenCalledWith(mockSwap);
+      expect(swapNursery.emit).toHaveBeenCalledWith('zeroconf.rejected', {
+        transaction: mockTransaction,
+        swap: mockSwap,
+      });
+      expect(SwapRepository.setSwapStatus).not.toHaveBeenCalled();
+    });
+
+    test('should re-emit chain swap zero-conf rejections without writing the status', async () => {
+      const mockChainSwap = {
+        type: SwapType.Chain,
+        chainSwap: { id: 'zeroconf-chain-swap' },
+        receivingData: { transactionVout: 0 },
+        status: SwapUpdateEvent.TransactionZeroConfRejected,
+      } as any;
+
+      (swapNursery as any).utxoNursery.emit(
+        'chainSwap.lockup.zeroconf.rejected',
+        {
+          swap: mockChainSwap,
+          transaction: mockTransaction,
+          reason: 'greedy fees',
+        },
+      );
+
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      expect(swapNursery.emit).toHaveBeenCalledWith('zeroconf.rejected', {
+        transaction: mockTransaction,
+        swap: mockChainSwap,
+      });
+      expect(WrappedSwapRepository.setStatus).not.toHaveBeenCalled();
     });
   });
 

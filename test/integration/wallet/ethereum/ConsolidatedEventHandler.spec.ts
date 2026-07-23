@@ -79,22 +79,28 @@ describe('ConsolidatedEventHandler integration', () => {
     tokenAddress: '0xtoken',
   });
 
-  const ethLockupPayload = async (): Promise<Events['eth.lockup']> => {
+  const ethLockupPayload = async (
+    logIndex: number = 0,
+  ): Promise<Events['eth.lockup']> => {
     const transaction = await sendTransaction();
 
     return {
       version: 4n,
       transaction,
+      logIndex,
       etherSwapValues: etherSwapValues(),
     };
   };
 
-  const erc20LockupPayload = async (): Promise<Events['erc20.lockup']> => {
+  const erc20LockupPayload = async (
+    logIndex: number = 0,
+  ): Promise<Events['erc20.lockup']> => {
     const transaction = await sendTransaction();
 
     return {
       version: 4n,
       transaction,
+      logIndex,
       erc20SwapValues: erc20SwapValues(),
     };
   };
@@ -202,6 +208,7 @@ describe('ConsolidatedEventHandler integration', () => {
 
     await consolidated.handleEvent('eth.lockup', {
       version: 4n,
+      logIndex: 0,
       transaction: { hash: null } as any,
       etherSwapValues: etherSwapValues(),
     } as Events['eth.lockup']);
@@ -210,6 +217,49 @@ describe('ConsolidatedEventHandler integration', () => {
     await mineAndNotify();
 
     expect(emitted).not.toHaveBeenCalled();
+
+    destroy();
+  });
+
+  test('queues lockup events of the same transaction with different log indices separately', async () => {
+    const { consolidated, mineAndNotify, destroy } = createConsolidated(2);
+
+    const emitted = jest.fn();
+    consolidated.on('eth.lockup', emitted);
+
+    const payload = await ethLockupPayload(1);
+    await consolidated.handleEvent('eth.lockup', payload);
+    await consolidated.handleEvent('eth.lockup', {
+      ...payload,
+      logIndex: 2,
+    });
+
+    await mineAndNotify();
+
+    expect(emitted).toHaveBeenCalledTimes(2);
+    expect(emitted).toHaveBeenCalledWith(
+      expect.objectContaining({ logIndex: 1 }),
+    );
+    expect(emitted).toHaveBeenCalledWith(
+      expect.objectContaining({ logIndex: 2 }),
+    );
+
+    destroy();
+  });
+
+  test('deduplicates redeliveries of the same lockup log', async () => {
+    const { consolidated, mineAndNotify, destroy } = createConsolidated(2);
+
+    const emitted = jest.fn();
+    consolidated.on('eth.lockup', emitted);
+
+    const payload = await ethLockupPayload(1);
+    await consolidated.handleEvent('eth.lockup', payload);
+    await consolidated.handleEvent('eth.lockup', payload);
+
+    await mineAndNotify();
+
+    expect(emitted).toHaveBeenCalledTimes(1);
 
     destroy();
   });

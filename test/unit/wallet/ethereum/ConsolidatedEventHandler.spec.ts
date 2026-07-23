@@ -74,6 +74,7 @@ describe('ConsolidatedEventHandler', () => {
     hash: string,
     blockNumber: number,
     swapValues = defaultEtherSwapValues,
+    logIndex = 0,
   ): Events['eth.lockup'] =>
     ({
       version: 4n,
@@ -81,6 +82,7 @@ describe('ConsolidatedEventHandler', () => {
         hash,
         blockNumber,
       },
+      logIndex,
       etherSwapValues: swapValues,
     }) as Events['eth.lockup'];
 
@@ -109,6 +111,7 @@ describe('ConsolidatedEventHandler', () => {
     hash: string,
     blockNumber: number,
     swapValues = defaultErc20SwapValues,
+    logIndex = 0,
   ): Events['erc20.lockup'] =>
     ({
       version: 4n,
@@ -116,6 +119,7 @@ describe('ConsolidatedEventHandler', () => {
         hash,
         blockNumber,
       },
+      logIndex,
       erc20SwapValues: swapValues,
     }) as Events['erc20.lockup'];
 
@@ -602,7 +606,7 @@ describe('ConsolidatedEventHandler', () => {
       jest.spyOn(Date, 'now').mockRestore();
     });
 
-    test('keeps distinct events from the same txHash with different swap values', async () => {
+    test('keeps distinct events from the same txHash with different log indices', async () => {
       const { provider, emitBlock } = createProvider(100);
       provider.getTransactionReceipt.mockResolvedValue({
         blockNumber: 100,
@@ -616,10 +620,12 @@ describe('ConsolidatedEventHandler', () => {
       const emitted = jest.fn();
       consolidated.on('eth.lockup', emitted);
 
-      const valuesA = { ...defaultEtherSwapValues, amount: 1000n };
-      const valuesB = { ...defaultEtherSwapValues, amount: 2000n };
-      v3.emitters['eth.lockup']!(ethLockup('0xsame-tx', 100, valuesA));
-      v3.emitters['eth.lockup']!(ethLockup('0xsame-tx', 100, valuesB));
+      v3.emitters['eth.lockup']!(
+        ethLockup('0xsame-tx', 100, defaultEtherSwapValues, 1),
+      );
+      v3.emitters['eth.lockup']!(
+        ethLockup('0xsame-tx', 100, defaultEtherSwapValues, 2),
+      );
       await flushAsync();
 
       await emitBlock(101);
@@ -649,7 +655,7 @@ describe('ConsolidatedEventHandler', () => {
       expect(emitted).toHaveBeenCalledTimes(1);
     });
 
-    test('keeps distinct erc20 events from the same txHash with different token addresses', async () => {
+    test('keeps distinct erc20 events from the same txHash with different log indices', async () => {
       const { provider, emitBlock } = createProvider(100);
       provider.getTransactionReceipt.mockResolvedValue({
         blockNumber: 100,
@@ -663,13 +669,11 @@ describe('ConsolidatedEventHandler', () => {
       const emitted = jest.fn();
       consolidated.on('erc20.lockup', emitted);
 
-      const valuesA = { ...defaultErc20SwapValues, tokenAddress: '0xtokena' };
-      const valuesB = { ...defaultErc20SwapValues, tokenAddress: '0xtokenb' };
       v3.emitters['erc20.lockup']!(
-        erc20Lockup('0xerc20-same-tx', 100, valuesA),
+        erc20Lockup('0xerc20-same-tx', 100, defaultErc20SwapValues, 1),
       );
       v3.emitters['erc20.lockup']!(
-        erc20Lockup('0xerc20-same-tx', 100, valuesB),
+        erc20Lockup('0xerc20-same-tx', 100, defaultErc20SwapValues, 2),
       );
       await flushAsync();
 

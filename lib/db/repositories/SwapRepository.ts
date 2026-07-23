@@ -2,14 +2,23 @@ import type { CreateOptions, Order, WhereOptions } from 'sequelize';
 import { Op, Transaction } from 'sequelize';
 import { SwapUpdateEvent } from '../../consts/Enums';
 import Database from '../Database';
+import type { LockupTargetStatus, LockupWriteResult } from '../LockupIdentity';
+import {
+  LockupWriteOutcome,
+  decideLockupWrite,
+  shouldWriteZeroConfRejection,
+} from '../LockupIdentity';
 import type { SwapType } from '../models/Swap';
 import Swap from '../models/Swap';
 
 class SwapRepository {
   public static readonly lockupNonUpdatableStatuses = [
+    SwapUpdateEvent.InvoicePending,
     SwapUpdateEvent.InvoicePaid,
+    SwapUpdateEvent.InvoiceFailedToPay,
     SwapUpdateEvent.TransactionClaimPending,
     SwapUpdateEvent.TransactionClaimed,
+    SwapUpdateEvent.SwapExpired,
   ];
 
   public static getSwaps = (
@@ -126,27 +135,94 @@ class SwapRepository {
     swap: Swap,
     lockupTransactionId: string,
     onchainAmount: number,
-    confirmed: boolean,
+    status: LockupTargetStatus,
     lockupTransactionVout?: number,
-  ): Promise<Swap> => {
-    await Swap.update(
-      {
-        onchainAmount,
-        lockupTransactionId,
-        lockupTransactionVout,
-        status: confirmed
-          ? SwapUpdateEvent.TransactionConfirmed
-          : SwapUpdateEvent.TransactionMempool,
-      },
-      {
-        where: {
-          id: swap.id,
-          status: {
-            [Op.notIn]: SwapRepository.lockupNonUpdatableStatuses,
+  ): Promise<LockupWriteResult<Swap>> => {
+    const outcome = await Database.sequelize.transaction(
+      async (transaction) => {
+        const current = await Swap.findOne({
+          transaction,
+          lock: transaction.LOCK.UPDATE,
+          where: { id: swap.id },
+        });
+        if (current === null) {
+          return LockupWriteOutcome.Rejected;
+        }
+
+        const decision = decideLockupWrite({
+          existing:
+            current.lockupTransactionId == null
+              ? null
+              : {
+                  transactionId: current.lockupTransactionId,
+                  vout: current.lockupTransactionVout,
+                },
+          incoming: {
+            transactionId: lockupTransactionId,
+            vout: lockupTransactionVout,
           },
-        },
+          currentStatus: current.status as SwapUpdateEvent,
+          targetStatus: status,
+          updatable: !SwapRepository.lockupNonUpdatableStatuses.includes(
+            current.status as SwapUpdateEvent,
+          ),
+        });
+
+        if (decision.write) {
+          await current.update(
+            {
+              status,
+              onchainAmount,
+              lockupTransactionId,
+              lockupTransactionVout: decision.vout,
+            },
+            { transaction },
+          );
+        }
+
+        return decision.outcome;
       },
     );
+
+    return {
+      outcome,
+      swap: (await SwapRepository.getSwap({ id: swap.id })) || swap,
+    };
+  };
+
+  public static setZeroConfRejected = async (
+    swap: Swap,
+    transactionId: string,
+    transactionVout?: number,
+  ): Promise<Swap> => {
+    await Database.sequelize.transaction(async (transaction) => {
+      const current = await Swap.findOne({
+        transaction,
+        lock: transaction.LOCK.UPDATE,
+        where: { id: swap.id },
+      });
+      if (
+        current === null ||
+        !shouldWriteZeroConfRejection({
+          existing:
+            current.lockupTransactionId == null
+              ? null
+              : {
+                  transactionId: current.lockupTransactionId,
+                  vout: current.lockupTransactionVout,
+                },
+          incoming: { transactionId, vout: transactionVout },
+          currentStatus: current.status as SwapUpdateEvent,
+        })
+      ) {
+        return;
+      }
+
+      await current.update(
+        { status: SwapUpdateEvent.TransactionZeroConfRejected },
+        { transaction },
+      );
+    });
 
     return (await SwapRepository.getSwap({ id: swap.id })) || swap;
   };

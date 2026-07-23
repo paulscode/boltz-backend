@@ -115,6 +115,10 @@ class EipSigner {
         swap.type === SwapType.Submarine
           ? (swap as Swap).lockupTransactionId
           : (swap as ChainSwapInfo).receivingData.lockupTransactionId;
+      const lockupLogIndex =
+        swap.type === SwapType.Submarine
+          ? (swap as Swap).lockupTransactionVout
+          : (swap as ChainSwapInfo).receivingData.transactionVout;
 
       if (lockupTransactionId === undefined || lockupTransactionId === null) {
         throw Errors.NOT_ELIGIBLE_FOR_COOPERATIVE_REFUND(
@@ -141,6 +145,7 @@ class EipSigner {
             contracts.etherSwap,
             lockupTransactionId,
             true,
+            lockupLogIndex ?? undefined,
           )
         : await queryERC20SwapValuesFromLock(
             swap,
@@ -148,6 +153,7 @@ class EipSigner {
             contracts.erc20Swap,
             lockupTransactionId,
             true,
+            lockupLogIndex ?? undefined,
           );
 
       await EipSigner.setRefundSignatureCreated(swap);

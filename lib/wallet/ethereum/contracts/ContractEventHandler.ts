@@ -19,6 +19,7 @@ type Events = {
   'eth.lockup': {
     version: bigint;
     transaction: Transaction | TransactionResponse;
+    logIndex: number;
     etherSwapValues: EtherSwapValues;
   };
   'eth.claim': {
@@ -32,6 +33,7 @@ type Events = {
   'erc20.lockup': {
     version: bigint;
     transaction: Transaction | TransactionResponse;
+    logIndex: number;
     erc20SwapValues: ERC20SwapValues;
   };
   'erc20.claim': {
@@ -125,6 +127,7 @@ class ContractEventHandler extends TypedEventEmitter<Events> {
       this.emit('eth.lockup', {
         version: this.version,
         transaction: await event.getTransaction(),
+        logIndex: event.index,
         etherSwapValues: formatEtherSwapValues(event.args!),
       });
     }
@@ -155,6 +158,7 @@ class ContractEventHandler extends TypedEventEmitter<Events> {
       this.emit('erc20.lockup', {
         version: this.version,
         transaction: await event.getTransaction(),
+        logIndex: event.index,
         erc20SwapValues: formatERC20SwapValues(event.args!),
       });
     }
@@ -224,6 +228,7 @@ class ContractEventHandler extends TypedEventEmitter<Events> {
         this.emit('eth.lockup', {
           version: this.version,
           transaction: await event.log.getTransaction(),
+          logIndex: event.log.index,
           etherSwapValues: {
             amount,
             claimAddress,
@@ -261,6 +266,7 @@ class ContractEventHandler extends TypedEventEmitter<Events> {
         this.emit('erc20.lockup', {
           version: this.version,
           transaction: await event.log.getTransaction(),
+          logIndex: event.log.index,
           erc20SwapValues: {
             amount,
             tokenAddress,
