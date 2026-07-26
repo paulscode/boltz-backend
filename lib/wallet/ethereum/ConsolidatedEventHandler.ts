@@ -194,8 +194,7 @@ class ConsolidatedEventHandler extends TypedEventEmitter<Events> {
       case 'eth.lockup':
       case 'erc20.lockup': {
         const lockupPayload = payload as
-          | Events['eth.lockup']
-          | Events['erc20.lockup'];
+          Events['eth.lockup'] | Events['erc20.lockup'];
 
         const txHash = lockupPayload.transaction.hash;
         if (txHash === null) {
