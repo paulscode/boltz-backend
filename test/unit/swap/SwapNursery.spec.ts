@@ -2919,6 +2919,7 @@ describe('SwapNursery', () => {
     beforeEach(async () => {
       findSend = jest.fn();
       mockWallet.findSend = findSend;
+      mockWallet.canFindSend = true;
       jest
         .spyOn(ReverseSwapRepository, 'getReverseSwap')
         .mockResolvedValue(reverseSwap);
@@ -2935,6 +2936,7 @@ describe('SwapNursery', () => {
 
     afterEach(() => {
       delete mockWallet.findSend;
+      delete mockWallet.canFindSend;
     });
 
     const block = async () => {
@@ -2952,6 +2954,7 @@ describe('SwapNursery', () => {
         { estimateFee: jest.fn().mockResolvedValue(2) },
         {
           symbol: 'BTC',
+          canFindSend: true,
           findSend: jest.fn().mockResolvedValue(undefined),
           sendToAddress: jest.fn().mockRejectedValue(new Error('hang up')),
         },
@@ -2959,6 +2962,40 @@ describe('SwapNursery', () => {
       );
 
       expect(nursery.unrecordedLockups.has(reverseSwap.id)).toEqual(true);
+    });
+
+    test('should not be remembered by a wallet that cannot tell what it sent', async () => {
+      const nursery = swapNursery as any;
+      await nursery.lockupUtxo(
+        reverseSwap,
+        { estimateFee: jest.fn().mockResolvedValue(2) },
+        {
+          symbol: 'L-BTC',
+          canFindSend: false,
+          findSend: jest.fn().mockResolvedValue(undefined),
+          sendToAddress: jest.fn().mockRejectedValue(new Error('hang up')),
+        },
+        SendApprovalAction.Accept,
+      );
+
+      expect(nursery.unrecordedLockups.has(reverseSwap.id)).toEqual(false);
+    });
+
+    test('should never fail the swap through a wallet that cannot tell what it sent', async () => {
+      const handleSwapSendFailed = jest
+        .spyOn(swapNursery as any, 'handleSwapSendFailed')
+        .mockResolvedValue(undefined);
+      mockWallet.canFindSend = false;
+      (swapNursery as any).unrecordedLockups.set(
+        reverseSwap.id,
+        Date.now() - SwapNursery.unsentLockupGraceMs - 1,
+      );
+
+      await block();
+
+      expect(findSend).not.toHaveBeenCalled();
+      expect(handleSwapSendFailed).not.toHaveBeenCalled();
+      expect((swapNursery as any).unrecordedLockups.size).toEqual(0);
     });
 
     test('should record a lockup the wallet sent, at the next block', async () => {
